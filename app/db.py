@@ -13,8 +13,10 @@ SEEDS = [
 def connect(db_path=None):
     path = db_path or Config.database()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
+    # 多个写者（含多进程 worker）排队等锁，而不是直接报 busy。
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 @contextmanager
@@ -72,10 +74,30 @@ def run_extract(conn, flow_id: int):
         )
     return get_flow(conn, flow_id)
 
-def run_land(conn, flow_id: int):
+class LandBlocked(Exception):
+    """合并尚未收尾时拒绝入库。"""
+
+    def __init__(self, detail: str, merge: dict):
+        super().__init__(detail)
+        self.detail = detail
+        self.merge = merge
+
+
+def run_land(conn, flow_id: int, require_merge: bool = True):
     item = get_flow(conn, flow_id)
     if not item:
         return None
+    if require_merge:
+        # 入库门禁：合并没收尾（无合并单 / 仍有待确认冲突）一律不准落库。
+        from app.merge import merge_status
+
+        gate = merge_status(conn, flow_id)
+        if not gate["finished"]:
+            if not gate["total"]:
+                detail = "合并未完成：该编排流尚无合并单，禁止入库"
+            else:
+                detail = f"合并未完成：仍有 {gate['pending']} 条待确认，禁止入库"
+            raise LandBlocked(detail, gate)
     if item["status"] == "已抽取待落库":
         conn.execute(
             "UPDATE flows SET status=?, landed=? WHERE id=?",

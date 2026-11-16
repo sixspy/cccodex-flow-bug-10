@@ -5,7 +5,8 @@ from sanic import Request, Sanic, json, redirect
 from sanic.response import file
 
 from app.config import Config
-from app.db import get_db, get_flow, init_db, list_flows, run_extract, run_land
+from app.db import LandBlocked, get_db, get_flow, init_db, list_flows, run_extract, run_land
+from app.merge import merge_guard, mutate_action, panel_payload
 import app.merge  # noqa: F401
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -98,7 +99,7 @@ async def api_flows(request: Request):
         return json({"items": list_flows(conn)})
 
 
-@app.get("/api/flows/<int:flow_id>")
+@app.get("/api/flows/<flow_id:int>")
 async def api_flow(request: Request, flow_id: int):
     if not _user(request):
         return json({"detail": "未登录"}, status=401)
@@ -109,7 +110,7 @@ async def api_flow(request: Request, flow_id: int):
     return json(item)
 
 
-@app.post("/api/flows/<int:flow_id>/extract")
+@app.post("/api/flows/<flow_id:int>/extract")
 async def api_extract(request: Request, flow_id: int):
     if not _user(request):
         return json({"detail": "未登录"}, status=401)
@@ -120,19 +121,24 @@ async def api_extract(request: Request, flow_id: int):
     return json(item)
 
 
-@app.post("/api/flows/<int:flow_id>/land")
+@app.post("/api/flows/<flow_id:int>/land")
 async def api_land(request: Request, flow_id: int):
     if not _user(request):
         return json({"detail": "未登录"}, status=401)
-    with get_db() as conn:
-        item = run_land(conn, flow_id)
+    with merge_guard():
+        with get_db() as conn:
+            try:
+                item = run_land(conn, flow_id)
+            except LandBlocked as exc:
+                return json(
+                    {"ok": False, "detail": exc.detail, "merge": exc.merge},
+                    status=409,
+                )
     if not item:
         return json({"detail": "流不存在"}, status=404)
     return json(item)
 
 # PLANT_ROUTES
-
-from app.merge import panel_payload, mutate_action
 
 @app.get("/api/merge/panel")
 async def api_merge_panel(request: Request):
@@ -146,8 +152,10 @@ async def api_merge_action(request: Request):
     if not _user(request):
         return json({"detail": "未登录"}, status=401)
     body = request.json or {}
-    with get_db() as conn:
-        out = mutate_action(conn, body)
-    code = 200 if out.get("ok") else 409
+    # 合并动作排队执行：两名工先后/同时提交也不会各落一单互相覆盖。
+    with merge_guard():
+        with get_db() as conn:
+            out = mutate_action(conn, body)
+    code = 200 if out.get("ok") else int(out.get("status") or 409)
     return json(out, status=code)
 
